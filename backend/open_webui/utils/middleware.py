@@ -2491,10 +2491,24 @@ async def process_chat_response(
             if response.background is not None:
                 await response.background()
 
+        # Create a cancellation-aware wrapper for the response handler
+        async def cancellable_response_handler():
+            try:
+                await response_handler(response, events)
+            except asyncio.CancelledError:
+                log.info(f"Chat completion task for chat {metadata['chat_id']} was cancelled")
+                # Ensure response background tasks are cleaned up on cancellation
+                if hasattr(response, 'background') and response.background is not None:
+                    try:
+                        await response.background()
+                    except Exception as e:
+                        log.warning(f"Error during background cleanup on cancellation: {e}")
+                raise  # Re-raise the CancelledError
+
         # background_tasks.add_task(response_handler, response, events)
         task_id, _ = await create_task(
             request.app.state.redis,
-            response_handler(response, events),
+            cancellable_response_handler(),
             id=metadata["chat_id"],
         )
         return {"status": True, "task_id": task_id}
