@@ -17,6 +17,8 @@ log.setLevel(SRC_LOG_LEVELS["MAIN"])
 # A dictionary to keep track of active tasks
 tasks: Dict[str, asyncio.Task] = {}
 item_tasks = {}
+# A dictionary to keep track of cancellable sessions associated with tasks
+task_sessions: Dict[str, object] = {}
 
 
 REDIS_TASKS_KEY = "open-webui:tasks"
@@ -36,6 +38,18 @@ async def redis_task_command_listener(app):
             command = json.loads(message["data"])
             if command.get("action") == "stop":
                 task_id = command.get("task_id")
+                # Close any associated session first
+                session = task_sessions.get(task_id)
+                if session:
+                    try:
+                        if hasattr(session, 'close'):
+                            if asyncio.iscoroutinefunction(session.close):
+                                await session.close()
+                            else:
+                                session.close()
+                    except Exception as e:
+                        log.warning(f"Error closing session for task {task_id}: {e}")
+                
                 local_task = tasks.get(task_id)
                 if local_task:
                     local_task.cancel()
@@ -86,6 +100,7 @@ async def cleanup_task(redis, task_id: str, id=None):
         await redis_cleanup_task(redis, task_id, id)
 
     tasks.pop(task_id, None)  # Remove the task if it exists
+    task_sessions.pop(task_id, None)  # Remove any associated session
 
     # If an ID is provided, remove the task from the item_tasks dictionary
     if id and task_id in item_tasks.get(id, []):
@@ -119,6 +134,21 @@ async def create_task(redis, coroutine, id=None):
     return task_id, task
 
 
+def register_task_session(task_id: str, session):
+    """
+    Register a cancellable session (like aiohttp ClientSession) with a task.
+    This allows the session to be properly closed when the task is cancelled.
+    """
+    task_sessions[task_id] = session
+
+
+def get_task_session(task_id: str):
+    """
+    Get the session associated with a task.
+    """
+    return task_sessions.get(task_id)
+
+
 async def list_tasks(redis):
     """
     List all currently active task IDs.
@@ -141,6 +171,18 @@ async def stop_task(redis, task_id: str):
     """
     Cancel a running task and remove it from the global task list.
     """
+    # Close any associated session first
+    session = task_sessions.get(task_id)
+    if session:
+        try:
+            if hasattr(session, 'close'):
+                if asyncio.iscoroutinefunction(session.close):
+                    await session.close()
+                else:
+                    session.close()
+        except Exception as e:
+            log.warning(f"Error closing session for task {task_id}: {e}")
+    
     if redis:
         # PUBSUB: All instances check if they have this task, and stop if so.
         await redis_send_command(
